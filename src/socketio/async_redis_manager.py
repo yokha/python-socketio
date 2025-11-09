@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import random
 from urllib.parse import urlparse
 
 try:
@@ -53,21 +52,13 @@ class AsyncRedisManager(AsyncPubSubManager):
     :param redis_options: additional keyword arguments to be passed to
                           ``Redis.from_url()`` or ``Sentinel()``.
     """
+    name = 'aioredis'
 
-    name = "aioredis"
-
-    def __init__(
-        self,
-        url="redis://localhost:6379/0",
-        channel="socketio",
-        write_only=False,
-        logger=None,
-        redis_options=None,
-    ):
-        if aioredis and not hasattr(
-            aioredis.Redis, "from_url"
-        ):  # pragma: no cover
-            raise RuntimeError("Version 2 of aioredis package is required.")
+    def __init__(self, url='redis://localhost:6379/0', channel='socketio',
+                 write_only=False, logger=None, redis_options=None):
+        if aioredis and \
+                not hasattr(aioredis.Redis, 'from_url'):  # pragma: no cover
+            raise RuntimeError('Version 2 of aioredis package is required.')
         super().__init__(channel=channel, write_only=write_only, logger=logger)
         self.redis_url = url
         self.redis_options = redis_options or {}
@@ -75,50 +66,47 @@ class AsyncRedisManager(AsyncPubSubManager):
 
     def _get_redis_module_and_error(self):
         parsed_url = urlparse(self.redis_url)
-        scheme = parsed_url.scheme.split("+", 1)[0].lower()
-        if scheme in ["redis", "rediss"]:
+        scheme = parsed_url.scheme.split('+', 1)[0].lower()
+        if scheme in ['redis', 'rediss']:
             if aioredis is None or RedisError is None:
-                raise RuntimeError(
-                    "Redis package is not installed "
-                    '(Run "pip install redis" '
-                    "in your virtualenv)."
-                )
+                raise RuntimeError('Redis package is not installed '
+                                   '(Run "pip install redis" '
+                                   'in your virtualenv).')
             return aioredis, RedisError
         if scheme in ["valkey", "valkeys"]:
             if aiovalkey is None or ValkeyError is None:
-                raise RuntimeError(
-                    "Valkey package is not installed "
-                    '(Run "pip install valkey" '
-                    "in your virtualenv)."
-                )
+                raise RuntimeError('Valkey package is not installed '
+                                   '(Run "pip install valkey" '
+                                   'in your virtualenv).')
             return aiovalkey, ValkeyError
-        if scheme == "unix":
-            if aioredis is not None and RedisError is not None:
+        if scheme == 'unix':
+            if aioredis is None or RedisError is None:
+                if aiovalkey is None or ValkeyError is None:
+                    raise RuntimeError('Redis package is not installed '
+                                       '(Run "pip install redis" '
+                                       'or "pip install valkey" '
+                                       'in your virtualenv).')
+                else:
+                    return aiovalkey, ValkeyError
+            else:
                 return aioredis, RedisError
-            if aiovalkey is not None and ValkeyError is not None:
-                return aiovalkey, ValkeyError
-            raise RuntimeError('Install "redis" or "valkey" package.')
-        raise ValueError(f"Unsupported Redis URL scheme: {scheme}")
+        error_msg = f'Unsupported Redis URL scheme: {scheme}'
+        raise ValueError(error_msg)
 
     def _redis_connect(self):
         module, _ = self._get_redis_module_and_error()
         parsed_url = urlparse(self.redis_url)
-
         # Backend-aware pubsub socket defaults. Caller can override.
-        is_valkey = module.__name__.startswith("valkey.")
         pubsub_defaults = {
+            # channels as bytes
             "decode_responses": False,
+            # Keep TCP alive at kernel level
             "socket_keepalive": True,
-            "retry_on_timeout": False,
+            # block on pub/sub read
+            "socket_timeout": None,
+            # no PINGs on pubsub sockets (redis & valkey)
+            "health_check_interval": 0,
         }
-        if is_valkey:
-            pubsub_defaults.update(
-                {
-                    "socket_timeout": None,  # block indefinitely
-                    "socket_connect_timeout": 3,  # fail fast on bad host
-                    "health_check_interval": 0,  # no PINGs on pubsub socket
-                }
-            )
 
         kwargs = {**pubsub_defaults, **(self.redis_options or {})}
 
@@ -137,6 +125,7 @@ class AsyncRedisManager(AsyncPubSubManager):
     async def _publish(self, data):  # pragma: no cover
         retry = True
         _, error = self._get_redis_module_and_error()
+        backend_name = getattr(self, "name", "redis")
         while True:
             try:
                 if not retry:
@@ -146,41 +135,33 @@ class AsyncRedisManager(AsyncPubSubManager):
             except error as exc:
                 if retry:
                     self._get_logger().error(
-                        'Cannot publish to redis... '
+                        'Cannot publish to ' f'{backend_name}...'
                         'retrying',
                         extra={"redis_exception": str(exc)})
                     retry = False
                 else:
                     self._get_logger().error(
-                        'Cannot publish to redis... '
+                        'Cannot publish to ' f'{backend_name}...'
                         'giving up',
                         extra={"redis_exception": str(exc)})
 
                     break
 
     async def _redis_listen_with_retries(self):  # pragma: no cover
-        """
-        Stream pub/sub messages forever; auto-reconnect on transient errors.
-        - Works with both Redis and Valkey (we detect the right error class).
-        - Backoff: 1s -> 2 -> 4 ... capped at 60s, with ±20% jitter.
-        - Any successfully received message resets the backoff to 1s.
-        - On shutdown (CancelledError) we try to unsubscribe cleanly.
-        """
-        backoff = 1.0
-        max_backoff = 60.0
-        connect_needed = True
-        _, BackendError = self._get_redis_module_and_error()
+        retry_sleep = 1
+        connect = True
+        _, error = self._get_redis_module_and_error()
         backend_name = getattr(self, "name", "redis")
 
         while True:
             try:
-                if connect_needed:
+                if connect:
                     self._redis_connect()
                     await self.pubsub.subscribe(self.channel)
-                    connect_needed = False
+                    connect = False
+                    retry_sleep = 1
 
                 async for message in self.pubsub.listen():
-                    backoff = 1.0
                     yield message
 
             except asyncio.CancelledError:
@@ -188,18 +169,18 @@ class AsyncRedisManager(AsyncPubSubManager):
                     await self.pubsub.unsubscribe(self.channel)
                 raise
 
-            except (BackendError, OSError, TimeoutError) as exc:
+            except (error, OSError, TimeoutError) as exc:
                 self._get_logger().error(
-                    "%s pub/sub listen error; reconnecting in %.1fs",
+                    "%s pub/sub listen error; retrying in %s secs",
                     backend_name,
-                    backoff,
-                    extra={"backend_exception": str(exc)},
+                    retry_sleep,
+                    extra={"redis_exception": str(exc)},
                 )
-                connect_needed = True
-
-                jitter = backoff * (random.random() * 0.4 - 0.2)
-                await asyncio.sleep(max(0.0, backoff + jitter))
-                backoff = min(backoff * 2, max_backoff)
+                connect = True
+                await asyncio.sleep(retry_sleep)
+                retry_sleep *= 2
+                if retry_sleep > 60:
+                    retry_sleep = 60
 
     @staticmethod
     def _channel_matches(expected: bytes, msg_channel) -> bool:
